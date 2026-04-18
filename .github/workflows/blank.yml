@@ -72,7 +72,7 @@ jobs:
           import subprocess
 
           PROJECT_NAME = os.environ.get("PROJECT_NAME", "qwen35_ultra_verbose_bench_1_10")
-          MODEL_NAME = os.environ.get("INPUT_MODEL_NAME") or os.environ.get("MODEL_NAME_OVERRIDE") or "${{ inputs.model_name }}"
+          MODEL_NAME = os.environ.get("INPUT_MODEL_NAME") or "${{ inputs.model_name }}"
           LEARNING_RATE = os.environ.get("INPUT_LEARNING_RATE") or "${{ inputs.learning_rate }}"
           MAX_TRAIN_ITERS = int(os.environ.get("INPUT_MAX_TRAIN_ITERS_PER_RUN") or "${{ inputs.max_train_iters_per_run }}")
           SUBSET_SIZES_RAW = os.environ.get("INPUT_SUBSET_SIZES") or "${{ inputs.subset_sizes }}"
@@ -90,31 +90,28 @@ jobs:
 
           def truncate_text(text, max_chars):
               text = sanitize_text(text)
-              if len(text) <= max_chars:
-                  return text
               return text[:max_chars]
 
           def build_ultra_verbose_example(record):
-              problem = truncate_text(record.get("problem", ""), 1200)
-              thinking = truncate_text(record.get("thinking", ""), 2000)
-              solution = truncate_text(record.get("solution", ""), 600)
+              problem = truncate_text(record.get("problem", ""), 400)
+              thinking = truncate_text(record.get("thinking", ""), 600)
+              solution = truncate_text(record.get("solution", ""), 160)
 
               prompt = (
-                  "You are an ultra-verbose mathematical reasoning assistant. "
-                  "Solve the following problem carefully, explain every major step, "
-                  "double-check the arithmetic, and then provide a final answer.\n\n"
+                  "You are an ultra-verbose mathematical reasoning assistant.\n"
+                  "Solve the problem carefully and explain the key steps.\n\n"
                   "Problem:\n"
                   f"{problem}\n\n"
-                  "Respond in this format:\n"
-                  "<think>your detailed reasoning</think>\n"
-                  "Final answer: your final answer"
+                  "Format:\n"
+                  "<think>reasoning</think>\n"
+                  "Final answer: answer"
               )
 
               completion = (
                   "<think>\n"
                   f"{thinking}\n"
-                  "</think>\n\n"
-                  "Final answer:\n"
+                  "</think>\n"
+                  "Final answer: "
                   f"{solution}"
               )
 
@@ -132,11 +129,10 @@ jobs:
                   if not part:
                       continue
                   n = int(part)
-                  if n <= 0:
-                      continue
-                  vals.append(min(n, limit))
-              seen = set()
+                  if n > 0:
+                      vals.append(min(n, limit))
               out = []
+              seen = set()
               for v in vals:
                   if v not in seen:
                       seen.add(v)
@@ -159,15 +155,13 @@ jobs:
                   "python", "-m", "mlx_lm", "generate",
                   "--model", model_name,
                   "--prompt", prompt,
-                  "--max-tokens", "256",
+                  "--max-tokens", "96",
                   "--temp", "0",
               ]
               if adapter_path:
                   cmd.extend(["--adapter-path", adapter_path])
               proc, elapsed = run_cmd(cmd)
-              stdout = proc.stdout.strip()
-              stderr = proc.stderr.strip()
-              return proc.returncode, stdout, stderr, elapsed
+              return proc.returncode, proc.stdout.strip(), proc.stderr.strip(), elapsed
 
           def main():
               log("SCRIPT START")
@@ -206,32 +200,14 @@ jobs:
                   adapter_dir.mkdir(parents=True, exist_ok=True)
 
                   train_rows = examples
-                  valid_rows = examples[:1]
                   test_rows = examples[:1]
 
                   write_jsonl(data_dir / "train.jsonl", train_rows)
-                  write_jsonl(data_dir / "valid.jsonl", valid_rows)
                   write_jsonl(data_dir / "test.jsonl", test_rows)
 
                   print(f"train_rows: {len(train_rows)}")
                   print(f"sample_prompt_preview: {train_rows[0]['prompt'][:300]!r}")
                   print(f"sample_completion_preview: {train_rows[0]['completion'][:300]!r}")
-
-                  probe_prompt = train_rows[0]["prompt"]
-
-                  log(f"BASE FORWARD CHECK n={subset_size}")
-                  base_rc, base_out, base_err, base_elapsed = timed_generate(MODEL_NAME, probe_prompt)
-                  print(f"base_return_code: {base_rc}")
-                  print(f"base_elapsed_seconds: {base_elapsed:.6f}")
-                  print(f"base_stdout_preview: {base_out[:500]!r}")
-                  if base_err:
-                      print(f"base_stderr_preview: {base_err[:500]!r}")
-                  if base_rc != 0:
-                      raise RuntimeError("Base forward pass failed.")
-
-                  del base_out, base_err
-                  gc.collect()
-                  time.sleep(3)
 
                   train_iters = min(MAX_TRAIN_ITERS, max(1, subset_size))
                   log(f"TRAIN START n={subset_size}")
@@ -266,30 +242,31 @@ jobs:
                   if not adapter_file.exists():
                       raise RuntimeError(f"Expected adapter file missing for subset {subset_size}")
 
+                  gc.collect()
+                  time.sleep(2)
+
                   log(f"TUNED FORWARD BENCH n={subset_size}")
                   forward_times = []
-                  forward_runs = min(3, len(test_rows))
-                  for idx in range(forward_runs):
-                      prompt = test_rows[idx % len(test_rows)]["prompt"]
+                  for idx in range(2):
+                      prompt = test_rows[0]["prompt"]
                       rc, out, err, elapsed = timed_generate(MODEL_NAME, prompt, str(adapter_dir))
                       print(f"forward_run_{idx+1:03d}_return_code: {rc}")
                       print(f"forward_run_{idx+1:03d}_elapsed_seconds: {elapsed:.6f}")
-                      print(f"forward_run_{idx+1:03d}_stdout_preview: {out[:500]!r}")
+                      print(f"forward_run_{idx+1:03d}_stdout_preview: {out[:300]!r}")
                       if err:
-                          print(f"forward_run_{idx+1:03d}_stderr_preview: {err[:500]!r}")
+                          print(f"forward_run_{idx+1:03d}_stderr_preview: {err[:300]!r}")
                       if rc != 0:
                           raise RuntimeError(f"Tuned forward pass failed for subset {subset_size} run {idx+1}")
                       forward_times.append(elapsed)
 
                   avg_forward = sum(forward_times) / len(forward_times)
-                  sec_per_iter = train_elapsed / train_iters if train_iters else float("nan")
+                  sec_per_iter = train_elapsed / train_iters
 
                   results.append({
                       "subset_size": subset_size,
                       "train_iters": train_iters,
                       "train_elapsed_seconds": train_elapsed,
                       "train_seconds_per_iter": sec_per_iter,
-                      "base_forward_seconds": base_elapsed,
                       "tuned_forward_avg_seconds": avg_forward,
                       "projected_tuned_forward_1k_seconds": avg_forward * 1000.0,
                       "projected_tuned_forward_10k_seconds": avg_forward * 10000.0,
