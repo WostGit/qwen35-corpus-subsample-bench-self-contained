@@ -61,21 +61,15 @@ jobs:
           set -euxo pipefail
           cat > run_embedded_benchmark.py <<'PY'
           import os
-          import io
-          import re
           import gc
           import sys
           import json
           import time
-          import math
           import gzip
           import base64
           import shutil
-          import random
           import pathlib
-          import tempfile
           import subprocess
-          from collections import Counter
 
           PROJECT_NAME = os.environ.get("PROJECT_NAME", "qwen35_ultra_verbose_bench_1_10")
           MODEL_NAME = os.environ.get("INPUT_MODEL_NAME") or os.environ.get("MODEL_NAME_OVERRIDE") or "${{ inputs.model_name }}"
@@ -92,13 +86,18 @@ jobs:
           def sanitize_text(text):
               if text is None:
                   return ""
-              text = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
-              return text
+              return str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+          def truncate_text(text, max_chars):
+              text = sanitize_text(text)
+              if len(text) <= max_chars:
+                  return text
+              return text[:max_chars]
 
           def build_ultra_verbose_example(record):
-              problem = sanitize_text(record.get("problem", ""))
-              thinking = sanitize_text(record.get("thinking", ""))
-              solution = sanitize_text(record.get("solution", ""))
+              problem = truncate_text(record.get("problem", ""), 1200)
+              thinking = truncate_text(record.get("thinking", ""), 2000)
+              solution = truncate_text(record.get("solution", ""), 600)
 
               prompt = (
                   "You are an ultra-verbose mathematical reasoning assistant. "
@@ -156,7 +155,13 @@ jobs:
               return proc, elapsed
 
           def timed_generate(model_name, prompt, adapter_path=None):
-              cmd = ["python", "-m", "mlx_lm.generate", "--model", model_name, "--prompt", prompt, "--max-tokens", "256", "--temp", "0"]
+              cmd = [
+                  "python", "-m", "mlx_lm", "generate",
+                  "--model", model_name,
+                  "--prompt", prompt,
+                  "--max-tokens", "256",
+                  "--temp", "0",
+              ]
               if adapter_path:
                   cmd.extend(["--adapter-path", adapter_path])
               proc, elapsed = run_cmd(cmd)
@@ -224,10 +229,14 @@ jobs:
                   if base_rc != 0:
                       raise RuntimeError("Base forward pass failed.")
 
+                  del base_out, base_err
+                  gc.collect()
+                  time.sleep(3)
+
                   train_iters = min(MAX_TRAIN_ITERS, max(1, subset_size))
                   log(f"TRAIN START n={subset_size}")
                   train_cmd = [
-                      "python", "-m", "mlx_lm.lora",
+                      "python", "-m", "mlx_lm", "lora",
                       "--train",
                       "--model", MODEL_NAME,
                       "--data", str(data_dir),
@@ -236,7 +245,7 @@ jobs:
                       "--batch-size", "1",
                       "--learning-rate", str(LEARNING_RATE),
                       "--steps-per-report", "1",
-                      "--steps-per-eval", str(max(1, train_iters)),
+                      "--steps-per-eval", "1000000",
                       "--mask-prompt",
                   ]
                   print("train_command:", " ".join(train_cmd))
@@ -259,7 +268,6 @@ jobs:
 
                   log(f"TUNED FORWARD BENCH n={subset_size}")
                   forward_times = []
-                  forward_outputs = []
                   forward_runs = min(3, len(test_rows))
                   for idx in range(forward_runs):
                       prompt = test_rows[idx % len(test_rows)]["prompt"]
@@ -272,7 +280,6 @@ jobs:
                       if rc != 0:
                           raise RuntimeError(f"Tuned forward pass failed for subset {subset_size} run {idx+1}")
                       forward_times.append(elapsed)
-                      forward_outputs.append(out[:200])
 
                   avg_forward = sum(forward_times) / len(forward_times)
                   sec_per_iter = train_elapsed / train_iters if train_iters else float("nan")
@@ -289,6 +296,7 @@ jobs:
                   })
 
                   gc.collect()
+                  time.sleep(2)
 
               log("FINAL SUMMARY")
               print(json.dumps(results, indent=2))
